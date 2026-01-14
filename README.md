@@ -4,7 +4,7 @@ Personal repo for KOReader-related plugins and patches.
 
 ## What is here
 
-- `plugins/` contains a modified version of the Readeck plugin originally by Ice Year.
+- `plugins/` contains a modified version of the Readeck plugin originally by [Ice Year](https://github.com/iceyear/readeck.koplugin).
 - `patches/` contains the patch files I apply to Readeck.
 - `plugins/` also includes a small plugin that fixes the progress bar (the file must be opened once to initialize).
 

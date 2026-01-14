@@ -1,0 +1,1738 @@
+--[[--
+@module koplugin.readeck
+]]
+
+-- Readeck for KOReader - Readeck API client plugin
+-- Based on wallabag2.koplugin by clach04
+
+local BD = require("ui/bidi")
+local DataStorage = require("datastorage")
+local Dispatcher = require("dispatcher")
+local DocSettings = require("docsettings")
+local DocumentRegistry = require("document/documentregistry")
+local Event = require("ui/event")
+local FFIUtil = require("ffi/util")
+local FileManager = require("apps/filemanager/filemanager")
+local InfoMessage = require("ui/widget/infomessage")
+local InputDialog = require("ui/widget/inputdialog")
+local JSON = require("json")
+local RadioButtonWidget = require("ui/widget/radiobuttonwidget")
+local LuaSettings = require("frontend/luasettings")
+local Math = require("optmath")
+local MultiConfirmBox = require("ui/widget/multiconfirmbox")
+local MultiInputDialog = require("ui/widget/multiinputdialog")
+local NetworkMgr = require("ui/network/manager")
+local ReadHistory = require("readhistory")
+local UIManager = require("ui/uimanager")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local filemanagerutil = require("apps/filemanager/filemanagerutil")
+local http = require("socket.http")
+local lfs = require("libs/libkoreader-lfs")
+local logger = require("logger")
+local ltn12 = require("ltn12")
+local socket = require("socket")
+local socketutil = require("socketutil")
+local util = require("util")
+local _ = require("gettext")
+local T = FFIUtil.template
+
+-- Implement leveled logging.
+local Log = {
+    DEBUG = 1,
+    INFO = 2,
+    WARN = 3,
+    ERROR = 4,
+    level = 4, -- Default to ERROR level.
+}
+
+function Log:debug(...)
+    if self.level <= self.DEBUG then
+        logger.info("READECK[DEBUG]:", ...)
+    end
+end
+
+function Log:info(...)
+    if self.level <= self.INFO then
+        logger.info("READECK[INFO]:", ...)
+    end
+end
+
+function Log:warn(...)
+    if self.level <= self.WARN then
+        logger.warn("READECK[WARN]:", ...)
+    end
+end
+
+function Log:error(...)
+    if self.level <= self.ERROR then
+        logger.err("READECK[ERROR]:", ...)
+    end
+end
+
+-- Set log level.
+Log.level = Log.WARN -- Adjust log level by changing Log.level.
+
+-- constants
+local article_id_suffix = " [rd-id_"
+local article_id_postfix = "]"
+local failed, skipped, downloaded = 1, 2, 3
+
+local Readeck = WidgetContainer:extend{
+    name = "readeck",
+}
+
+function Readeck:onDispatcherRegisterActions()
+    Dispatcher:registerAction("readeck_download", { category="none", event="SynchronizeReadeck", title=_("Readeck retrieval"), general=true,})
+end
+
+function Readeck:init()
+    Log:info("Initializing Readeck plugin")
+    self.token_expiry = 0
+    -- Initialize cached authentication info
+    self.cached_auth_token = ""
+    self.cached_username = ""
+    self.cached_password = ""
+    self.cached_server_url = ""
+    -- default values so that user doesn't have to explicitly set them
+    self.is_delete_finished = true
+    self.is_delete_read = false
+    self.is_auto_delete = false
+    self.is_sync_remote_delete = false
+    self.is_archiving_deleted = true
+    self.send_review_as_tags = false
+    self.filter_tag = ""
+    self.sort_param = "-created"  -- default to most recent first
+    self.ignore_tags = ""
+    self.auto_tags = ""
+    self.articles_per_sync = 30  -- max number of articles to get metadata for
+    
+    self.sort_options = {
+        {"created",    _("Added, oldest first")},
+        {"-created",   _("Added, most recent first")},
+        {"published",  _("Published, oldest first")},
+        {"-published", _("Published, most recent first")},
+        {"duration",   _("Duration, shortest first")},
+        {"-duration",  _("Duration, longest first")},
+        {"site",       _("Site name, A to Z")},
+        {"-site",      _("Site name, Z to A")},
+        {"title",      _("Title, A to Z")},
+        {"-title",     _("Title, Z to A")},
+    }
+    
+    -- Default timeout settings (seconds).
+    self.block_timeout = 30
+    self.total_timeout = 120
+    self.file_block_timeout = 10
+    self.file_total_timeout = 30
+    
+    -- Used to store session cookies.
+    self.cookies = {}
+
+    self:onDispatcherRegisterActions()
+    self.ui.menu:registerToMainMenu(self)
+    self.rd_settings = self:readSettings()
+    self.server_url = self.rd_settings.data.readeck.server_url
+    self.auth_token = self.rd_settings.data.readeck.auth_token or ""
+    self.username = self.rd_settings.data.readeck.username
+    self.password = self.rd_settings.data.readeck.password
+    self.directory = self.rd_settings.data.readeck.directory
+    
+    -- Load cached access token and expiry time.
+    self.access_token = self.rd_settings.data.readeck.access_token or ""
+    self.token_expiry = self.rd_settings.data.readeck.token_expiry or 0
+    -- Load auth info used to generate the current access_token.
+    self.cached_auth_token = self.rd_settings.data.readeck.cached_auth_token or ""
+    self.cached_username = self.rd_settings.data.readeck.cached_username or ""
+    self.cached_password = self.rd_settings.data.readeck.cached_password or ""
+    self.cached_server_url = self.rd_settings.data.readeck.cached_server_url or ""
+    
+    if self.rd_settings.data.readeck.is_delete_finished ~= nil then
+        self.is_delete_finished = self.rd_settings.data.readeck.is_delete_finished
+    end
+    if self.rd_settings.data.readeck.send_review_as_tags ~= nil then
+        self.send_review_as_tags = self.rd_settings.data.readeck.send_review_as_tags
+    end
+    if self.rd_settings.data.readeck.is_delete_read ~= nil then
+        self.is_delete_read = self.rd_settings.data.readeck.is_delete_read
+    end
+    if self.rd_settings.data.readeck.is_auto_delete ~= nil then
+        self.is_auto_delete = self.rd_settings.data.readeck.is_auto_delete
+    end
+    if self.rd_settings.data.readeck.is_sync_remote_delete ~= nil then
+        self.is_sync_remote_delete = self.rd_settings.data.readeck.is_sync_remote_delete
+    end
+    if self.rd_settings.data.readeck.is_archiving_deleted ~= nil then
+        self.is_archiving_deleted = self.rd_settings.data.readeck.is_archiving_deleted
+    end
+    if self.rd_settings.data.readeck.filter_tag then
+        self.filter_tag = self.rd_settings.data.readeck.filter_tag
+    end
+    if self.rd_settings.data.readeck.sort_param then
+        self.sort_param = self.rd_settings.data.readeck.sort_param
+    end
+    if self.rd_settings.data.readeck.ignore_tags then
+        self.ignore_tags = self.rd_settings.data.readeck.ignore_tags
+    end
+    if self.rd_settings.data.readeck.auto_tags then
+        self.auto_tags = self.rd_settings.data.readeck.auto_tags
+    end
+    if self.rd_settings.data.readeck.articles_per_sync ~= nil then
+        self.articles_per_sync = self.rd_settings.data.readeck.articles_per_sync
+    end
+    -- Load timeout settings.
+    if self.rd_settings.data.readeck.block_timeout ~= nil then
+        self.block_timeout = self.rd_settings.data.readeck.block_timeout
+    end
+    if self.rd_settings.data.readeck.total_timeout ~= nil then
+        self.total_timeout = self.rd_settings.data.readeck.total_timeout
+    end
+    if self.rd_settings.data.readeck.file_block_timeout ~= nil then
+        self.file_block_timeout = self.rd_settings.data.readeck.file_block_timeout
+    end
+    if self.rd_settings.data.readeck.file_total_timeout ~= nil then
+        self.file_total_timeout = self.rd_settings.data.readeck.file_total_timeout
+    end
+    self.remove_finished_from_history = self.rd_settings.data.readeck.remove_finished_from_history or false
+    self.download_queue = self.rd_settings.data.readeck.download_queue or {}
+
+    -- workaround for dateparser only available if newsdownloader is active
+    self.is_dateparser_available = false
+    self.is_dateparser_checked = false
+
+    -- workaround for dateparser, only once
+    -- the parser is in newsdownloader.koplugin, check if it is available
+    if not self.is_dateparser_checked then
+        local res
+        res, self.dateparser = pcall(require, "lib.dateparser")
+        if res then self.is_dateparser_available = true end
+        self.is_dateparser_checked = true
+    end
+
+    if self.ui and self.ui.link then
+        self.ui.link:addToExternalLinkDialog("25_readeck", function(this, link_url)
+            return {
+                text = _("Add to Readeck"),
+                callback = function()
+                    UIManager:close(this.external_link_dialog)
+                    this.ui:handleEvent(Event:new("AddReadeckArticle", link_url))
+                end,
+            }
+        end)
+    end
+    Log:info("Readeck plugin initialization complete")
+end
+
+function Readeck:addToMainMenu(menu_items)
+    menu_items.readeck = {
+        text = _("Readeck"),
+        sorting_hint = "tools",
+        sub_item_table = {
+            {
+                text = _("Synchronize articles with server"),
+                callback = function()
+                    self.ui:handleEvent(Event:new("SynchronizeReadeck"))
+                end,
+            },
+            {
+                text = _("Delete finished articles remotely"),
+                callback = function()
+                    local connect_callback = function()
+                        local num_deleted = self:processLocalFiles("manual")
+                        UIManager:show(InfoMessage:new{
+                            text = T(_("Articles processed.\nDeleted: %1"), num_deleted)
+                        })
+                        self:refreshCurrentDirIfNeeded()
+                    end
+                    NetworkMgr:runWhenOnline(connect_callback)
+                end,
+                enabled_func = function()
+                    return self.is_delete_finished or self.is_delete_read
+                end,
+            },
+            {
+                text = _("Go to download folder"),
+                callback = function()
+                    if self.ui.document then
+                        self.ui:onClose()
+                    end
+                    if FileManager.instance then
+                        FileManager.instance:reinit(self.directory)
+                    else
+                        FileManager:showFiles(self.directory)
+                    end
+                end,
+            },
+            {
+                text = _("Settings"),
+                callback_func = function()
+                    return nil
+                end,
+                separator = true,
+                sub_item_table = {
+                    {
+                        text = _("Configure Readeck server"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:editServerSettings()
+                        end,
+                    },
+                    {
+                        text = _("Configure Readeck client"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:editClientSettings()
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            local path
+                            if not self.directory or self.directory == "" then
+                                path = _("Not set")
+                            else
+                                path = filemanagerutil.abbreviate(self.directory)
+                            end
+                            return T(_("Download folder: %1"), BD.dirpath(path))
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self:setDownloadDirectory(touchmenu_instance)
+                        end,
+                        separator = true,
+                    },
+                    {
+                        text_func = function()
+                            local filter
+                            if not self.filter_tag or self.filter_tag == "" then
+                                filter = _("All articles")
+                            else
+                                filter = self.filter_tag
+                            end
+                            return T(_("Only download articles with tag: %1"), filter)
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self:setFilterTag(touchmenu_instance)
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            local sort_desc = self.sort_param
+                            for _, opt in ipairs(self.sort_options) do
+                                if opt[1] == self.sort_param then
+                                    sort_desc = opt[2]
+                                    break
+                                end
+                            end
+                            return T(_("Sort articles by: %1"), sort_desc)
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self:setSortParam(touchmenu_instance)
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            if not self.ignore_tags or self.ignore_tags == "" then
+                                return _("Tags to ignore")
+                            end
+                            return T(_("Tags to ignore (%1)"), self.ignore_tags)
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self:setTagsDialog(touchmenu_instance,
+                                _("Tags to ignore"),
+                                _("Enter a comma-separated list of tags to ignore"),
+                                self.ignore_tags,
+                                function(tags)
+                                    self.ignore_tags = tags
+                                end
+                            )
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            if not self.auto_tags or self.auto_tags == "" then
+                                return _("Tags to add to new articles")
+                            end
+                            return T(_("Tags to add to new articles (%1)"), self.auto_tags)
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self:setTagsDialog(touchmenu_instance,
+                                _("Tags to add to new articles"),
+                                _("Enter a comma-separated list of tags to automatically add to new articles"),
+                                self.auto_tags,
+                                function(tags)
+                                    self.auto_tags = tags
+                                end
+                            )
+                        end,
+                        separator = true,
+                    },
+                    {
+                        text = _("Remote removal"),
+                        separator = true,
+                        sub_item_table = {
+                            {
+                                text = _("Remove finished articles remotely"),
+                                checked_func = function() return self.is_delete_finished end,
+                                callback = function()
+                                    self.is_delete_finished = not self.is_delete_finished
+                                    self:saveSettings()
+                                end,
+                            },
+                            {
+                                text = _("Remove 100% read articles remotely"),
+                                checked_func = function() return self.is_delete_read end,
+                                callback = function()
+                                    self.is_delete_read = not self.is_delete_read
+                                    self:saveSettings()
+                                end,
+                                separator = true,
+                            },
+                            {
+                                text = _("Removal mode: archive instead of delete"),
+                                checked_func = function() return self.is_archiving_deleted end,
+                                callback = function()
+                                    self.is_archiving_deleted = not self.is_archiving_deleted
+                                    self:saveSettings()
+                                end,
+                                separator = true,
+                            },
+                            {
+                                text = _("Process removals when downloading"),
+                                checked_func = function() return self.is_auto_delete end,
+                                callback = function()
+                                    self.is_auto_delete = not self.is_auto_delete
+                                    self:saveSettings()
+                                end,
+                            },
+                            {
+                                text = _("Synchronize remotely removed files"),
+                                checked_func = function() return self.is_sync_remote_delete end,
+                                callback = function()
+                                    self.is_sync_remote_delete = not self.is_sync_remote_delete
+                                    self:saveSettings()
+                                end,
+                            },
+                        },
+                    },
+                    {
+                        text = _("Send review as tags"),
+                        help_text = _("This allow you to write tags in the review field, separated by commas, which can then be sent to Readeck."),
+                        keep_menu_open = true,
+                        checked_func = function()
+                            return self.send_review_as_tags or false
+                        end,
+                        callback = function()
+                            self.send_review_as_tags = not self.send_review_as_tags
+                            self:saveSettings()
+                        end,
+                    },
+                    {
+                        text = _("Remove finished articles from history"),
+                        keep_menu_open = true,
+                        checked_func = function()
+                            return self.remove_finished_from_history or false
+                        end,
+                        callback = function()
+                            self.remove_finished_from_history = not self.remove_finished_from_history
+                            self:saveSettings()
+                        end,
+                    },
+                    {
+                        text = _("Remove 100% read articles from history"),
+                        keep_menu_open = true,
+                        checked_func = function()
+                            return self.remove_read_from_history or false
+                        end,
+                        callback = function()
+                            self.remove_read_from_history = not self.remove_read_from_history
+                            self:saveSettings()
+                        end,
+                        separator = true,
+                    },
+                    {
+                        text = _("Reset access token"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:resetAccessToken()
+                        end,
+                        enabled_func = function()
+                            return not self:isempty(self.access_token)
+                        end,
+                    },
+                    {
+                        text = _("Clear all cached tokens"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:clearAllTokens()
+                        end,
+                        enabled_func = function()
+                            return not self:isempty(self.access_token)
+                        end,
+                        separator = true,
+                    },
+                    {
+                        text = _("Set timeout"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:editTimeoutSettings()
+                        end,
+                    },
+                    {
+                        text = _("Help"),
+                        keep_menu_open = true,
+                        callback = function()
+                            UIManager:show(InfoMessage:new{
+                                text = _([[Download directory: use a directory that is exclusively used by the Readeck plugin. Existing files in this directory risk being deleted.
+
+Articles marked as finished or 100% read can be removed from the server. When "Removal mode: archive instead of delete" is enabled, those removals archive rather than delete.
+Those articles can also be removed automatically when downloading new articles if the "Process removals when downloading" option is enabled.
+
+The "Synchronize remotely removed files" option will remove local files that no longer exist on the server.]])
+                            })
+                        end,
+                    }
+                }
+            },
+            {
+                text = _("Info"),
+                keep_menu_open = true,
+                callback = function()
+                    UIManager:show(InfoMessage:new{
+                        text = T(_([[Readeck is an open source read-it-later service. This plugin synchronizes with a Readeck server.
+
+More details: https://www.readeck.net
+
+Downloads to folder: %1]]), BD.dirpath(filemanagerutil.abbreviate(self.directory)))
+                    })
+                end,
+            },
+        },
+    }
+end
+
+function Readeck:isempty(s)
+    return s == nil or s == ""
+end
+
+function Readeck:resetAccessToken()
+    Log:info("Manually resetting access token")
+    
+    -- Clear current access token but keep cached credentials for comparison
+    self.access_token = ""
+    self.token_expiry = 0
+    
+    -- Try to get a new token immediately
+    if self:getBearerToken() then
+        UIManager:show(InfoMessage:new{
+            text = _("Access token reset successfully"),
+        })
+    else
+        UIManager:show(InfoMessage:new{
+            text = _("Failed to obtain new access token"),
+        })
+    end
+end
+
+function Readeck:clearAllTokens()
+    Log:info("Clearing all cached tokens and credentials")
+    
+    -- Clear all cached authentication data
+    self.access_token = ""
+    self.token_expiry = 0
+    self.cached_auth_token = ""
+    self.cached_username = ""
+    self.cached_password = ""
+    self.cached_server_url = ""
+    
+    -- Save the cleared state
+    self:saveSettings()
+    
+    UIManager:show(InfoMessage:new{
+        text = _("All cached tokens and credentials cleared"),
+    })
+end
+
+function Readeck:getBearerToken()
+    Log:debug("Getting bearer token")
+    
+    -- Check if the configuration is complete
+    local server_empty = self:isempty(self.server_url) 
+    local auth_empty = self:isempty(self.auth_token) and (self:isempty(self.username) or self:isempty(self.password))
+    local directory_empty = self:isempty(self.directory)
+    
+    if server_empty or auth_empty or directory_empty then
+        Log:warn("Configuration incomplete - Server:", server_empty and "missing" or "ok", 
+                 ", Auth:", auth_empty and "missing" or "ok", 
+                 ", Directory:", directory_empty and "missing" or "ok")
+        UIManager:show(MultiConfirmBox:new{
+            text = _("Please configure the server settings and set a download folder."),
+            choice1_text_func = function()
+                if server_empty or auth_empty then
+                    return _("Server (★)")
+                else
+                    return _("Server")
+                end
+            end,
+            choice1_callback = function() self:editServerSettings() end,
+            choice2_text_func = function()
+                if directory_empty then
+                    return _("Folder (★)")
+                else
+                    return _("Folder")
+                end
+            end,
+            choice2_callback = function() self:setDownloadDirectory() end,
+        })
+        return false
+    end
+
+    -- Check if the download directory is valid
+    local dir_mode = lfs.attributes(self.directory, "mode")
+    if dir_mode ~= "directory" then
+         Log:warn("Invalid download directory:", self.directory)
+         UIManager:show(InfoMessage:new{
+            text = _("The download directory is not valid.\nPlease configure it in the settings.")
+        })
+        return false
+    end
+    if string.sub(self.directory, -1) ~= "/" then
+        self.directory = self.directory .. "/"
+    end
+
+    -- Check if we already have a valid access token and auth info matches.
+    local now = os.time()
+    local auth_changed = false
+
+    -- Check if auth info changed.
+    if not self:isempty(self.auth_token) then
+        -- Using API token auth.
+        auth_changed = (self.auth_token ~= self.cached_auth_token) or
+                      (self.server_url ~= self.cached_server_url)
+    else
+        -- Using username/password auth.
+        auth_changed = (self.username ~= self.cached_username) or
+                      (self.password ~= self.cached_password) or
+                      (self.server_url ~= self.cached_server_url)
+    end
+
+    if not self:isempty(self.access_token) and self.token_expiry > now + 300 and not auth_changed then
+        -- Token still valid and auth unchanged; no refresh needed.
+        Log:debug("Using cached token, still valid for", self.token_expiry - now, "seconds")
+        return true
+    end
+    
+    if auth_changed then
+        Log:debug("Authentication credentials changed, invalidating cached token")
+    end
+
+    -- If API token exists, use it directly.
+    if not self:isempty(self.auth_token) then
+        Log:info("Using provided API token")
+        self.access_token = self.auth_token
+        -- Set a long expiry since API tokens typically don't expire.
+        self.token_expiry = now + 365 * 24 * 60 * 60 -- One year.
+        -- Save auth info used to generate this access_token.
+        self.cached_auth_token = self.auth_token
+        self.cached_username = ""
+        self.cached_password = ""
+        self.cached_server_url = self.server_url
+        self:saveSettings() -- Save the new token and expiry.
+        return true
+    end
+
+    -- If no token, fetch via username/password.
+    Log:info("No token provided, attempting to login with username/password")
+    local login_url = "/api/auth"  -- Update auth path to include /api prefix.
+
+    local body = {
+        username = self.username,
+        password = self.password,
+        application = "KOReader"
+    }
+
+    Log:debug("Auth request - Username:", self.username, "App: KOReader")
+    local bodyJSON = JSON.encode(body)
+    Log:debug("Auth request body:", bodyJSON)
+
+    local headers = {
+        ["Content-type"] = "application/json",
+        ["Accept"] = "application/json, */*",
+        ["Content-Length"] = tostring(#bodyJSON),
+    }
+    
+    Log:debug("Sending auth request to", self.server_url .. login_url)
+    local result = self:callAPI("POST", login_url, headers, bodyJSON, "")
+    
+    if result and result.token then
+        Log:info("Authentication successful, token received")
+        self.access_token = result.token
+        self.token_expiry = now + 365 * 24 * 60 * 60  -- Assume token valid for one year.
+        -- Save auth info used to generate this access_token.
+        self.cached_auth_token = ""
+        self.cached_username = self.username
+        self.cached_password = self.password
+        self.cached_server_url = self.server_url
+        -- Save access token and expiry.
+        self:saveSettings()
+        return true
+    else
+        Log:error("Authentication failed")
+        UIManager:show(InfoMessage:new{
+            text = _("Could not login to Readeck server."), 
+        })
+        return false
+    end
+end
+
+--- Get a JSON formatted list of articles from the server.
+-- The list should have self.article_per_sync item, or less if an error occured.
+-- If filter_tag is set, only articles containing this tag are queried.
+-- If ignore_tags is defined, articles containing either of the tags are skipped.
+function Readeck:getArticleList()
+    local filtering = ""
+    if self.filter_tag ~= "" then
+        filtering = "&labels=" .. self.filter_tag
+    end
+
+    local sorting = ""
+    if self.sort_param ~= "" then
+        sorting = "&sort=" .. self.sort_param
+    end
+
+    local article_list = {}
+    local offset = 0
+    local limit = math.min(self.articles_per_sync, 30)  -- Server default page size is 30.
+
+    -- Fetch articles from the server until the target count is reached.
+    while #article_list < self.articles_per_sync do
+        -- Get JSON containing the article list.
+        local articles_url = "/api/bookmarks?limit=" .. limit  -- Update list path to include /api prefix.
+                          .. "&offset=" .. offset
+                          .. "&is_archived=0"  -- Only fetch unarchived articles.
+                          .. "&type=article" -- No sense downloading videos, but maybe photos
+                          .. filtering
+                          .. sorting
+
+        Log:debug("Fetching article list with URL:", articles_url)
+        local articles_json, err, code = self:callAPI("GET", articles_url, nil, "", "", true)
+
+        if err == "http_error" and code == 404 then
+            -- Possibly the last page; no more articles.
+            Log:debug("Couldn't get offset", offset)
+            break -- Exit loop.
+        elseif err or articles_json == nil then
+            -- Other error; stop downloading or deleting.
+            Log:warn("Download at offset", offset, "failed with", err, code)
+            UIManager:show(InfoMessage:new{
+                text = _("Requesting article list failed."), })
+            return
+        end
+
+        -- Only keep actual articles from JSON.
+        -- Build an array for easier processing later.
+        local new_article_list = {}
+        for _, article in ipairs(articles_json) do
+            table.insert(new_article_list, article)
+        end
+
+        -- Apply filters.
+        new_article_list = self:filterIgnoredTags(new_article_list)
+
+        -- Append the filtered list to the final article list.
+        for _, article in ipairs(new_article_list) do
+            if #article_list == self.articles_per_sync then
+                Log:debug("Hit the article target", self.articles_per_sync)
+                break
+            end
+            table.insert(article_list, article)
+        end
+
+        if #new_article_list < limit then
+            -- If the server returns fewer than requested, there are no more articles.
+            Log:debug("No more articles to query")
+            break
+        end
+        
+        offset = offset + limit
+    end
+
+    return article_list
+end
+
+--- Remove all the articles from the list containing one of the ignored tags.
+-- article_list: array containing a json formatted list of articles
+-- returns: same array, but without any articles that contain an ignored tag.
+function Readeck:filterIgnoredTags(article_list)
+    -- decode all tags to ignore
+    local ignoring = {}
+    if self.ignore_tags ~= "" then
+        for tag in util.gsplit(self.ignore_tags, "[,]+", false) do
+            ignoring[tag] = true
+        end
+    end
+
+    -- rebuild a list without the ignored articles
+    local filtered_list = {}
+    for _, article in ipairs(article_list) do
+        local skip_article = false
+        for _, tag in ipairs(article.labels or {}) do
+            if ignoring[tag] then
+                skip_article = true
+                Log:debug("Ignoring tag", tag, "in article",
+                           article.id, ":", article.title)
+                break -- no need to look for other tags
+            end
+        end
+        if not skip_article then
+            table.insert(filtered_list, article)
+        end
+    end
+
+    return filtered_list
+end
+
+local function _format_lua_value(value)
+    local num = tonumber(value)
+    if num ~= nil then
+        return tostring(num)
+    end
+    return string.format("%q", tostring(value))
+end
+
+local function _get_sidecar_dir(path)
+    if DocSettings and DocSettings.getSidecarDir then
+        local ok, dir = pcall(function()
+            return DocSettings:getSidecarDir(path)
+        end)
+        if ok and dir and dir ~= "" then
+            return dir
+        end
+    end
+
+    local base_path = path:gsub("%.[^%.]+$", "")
+    return base_path .. ".sdr"
+end
+
+local function _delete_dir_recursive(path)
+    local mode = lfs.attributes(path, "mode")
+    if mode ~= "directory" then
+        return
+    end
+
+    for entry in lfs.dir(path) do
+        if entry ~= "." and entry ~= ".." then
+            local child = path .. "/" .. entry
+            local child_mode = lfs.attributes(child, "mode")
+            if child_mode == "directory" then
+                _delete_dir_recursive(child)
+            else
+                local ok, err = os.remove(child)
+                if not ok then
+                    Log:warn("Failed to remove sidecar file:", child, err)
+                end
+            end
+        end
+    end
+
+    local ok, err = lfs.rmdir(path)
+    if not ok then
+        Log:warn("Failed to remove sidecar dir:", path, err)
+    end
+end
+
+function Readeck:writeCustomMetadata(local_path, article)
+    if not article then return end
+
+    local read_time = article.reading_time or article.read_time or article.duration
+    local word_count = article.word_count or article.words
+
+    if read_time == nil and word_count == nil then
+        return
+    end
+
+    local sidecar_dir = _get_sidecar_dir(local_path)
+    local mode = lfs.attributes(sidecar_dir, "mode")
+    if mode ~= "directory" then
+        local ok, err = lfs.mkdir(sidecar_dir)
+        if not ok then
+            Log:warn("Failed to create sidecar dir:", sidecar_dir, err)
+            return
+        end
+    end
+
+    local metadata_path = sidecar_dir .. "/readeck_metadata.lua"
+    local fh, err = io.open(metadata_path, "w")
+    if not fh then
+        Log:warn("Failed to write custom metadata:", metadata_path, err)
+        return
+    end
+
+    fh:write("return {\n")
+    if read_time ~= nil then
+        fh:write(string.format("  read_time = %s,\n", _format_lua_value(read_time)))
+    end
+    if word_count ~= nil then
+        fh:write(string.format("  word_count = %s,\n", _format_lua_value(word_count)))
+    end
+    fh:write("}\n")
+    fh:close()
+end
+
+--- Download Readeck article.
+-- @string article
+-- @treturn int 1 failed, 2 skipped, 3 downloaded
+function Readeck:download(article)
+    local skip_article = false
+    local title = util.getSafeFilename(article.title, self.directory, 230, 0)
+    local file_ext = ".epub"
+    local item_url = "/api/bookmarks/" .. article.id .. "/article.epub"  -- Update download path to include /api prefix.
+
+    local local_path = self.directory .. title .. article_id_suffix .. article.id .. article_id_postfix .. file_ext
+    Log:debug("DOWNLOAD: id:", article.id)
+    Log:debug("DOWNLOAD: title:", article.title)
+    Log:debug("DOWNLOAD: filename:", local_path)
+
+    local attr = lfs.attributes(local_path)
+    if attr then
+        -- File exists; skip. Prefer skipping only if local file is newer than the server.
+        -- newsdownloader.koplugin has a date parser, only available when enabled.
+        if self.is_dateparser_available and article.created then
+            local server_date = self.dateparser.parse(article.created)
+            if server_date < attr.modification then
+                skip_article = true
+                Log:debug("Skipping file (date checked):", local_path)
+            end
+        else
+            skip_article = true
+            Log:debug("Skipping file:", local_path)
+        end
+    end
+
+    if skip_article == false then
+        if self:callAPI("GET", item_url, nil, "", local_path) then
+            self:writeCustomMetadata(local_path, article)
+            return downloaded
+        else
+            return failed
+        end
+    end
+    self:writeCustomMetadata(local_path, article)
+    return skipped
+end
+
+-- method: (mandatory) GET, POST, DELETE, PATCH, etc...
+-- apiurl: (mandatory) API call excluding the server path, or full URL to a file
+-- headers: defaults to auth if given nil value, provide all headers necessary if in use
+-- body: empty string if not needed
+-- filepath: downloads the file if provided, returns JSON otherwise
+-- @treturn result or (nil, "network_error") or (nil, "json_error")
+-- or (nil, "http_error", code)
+function Readeck:callAPI(method, apiurl, headers, body, filepath, quiet, retry_auth)
+    local sink = {}
+    local request = {}
+
+    -- Is it an API call, or a regular file direct download?
+    if apiurl:sub(1, 1) == "/" then
+        -- API call to our server, has the form "/random/api/call"
+        request.url = self.server_url .. apiurl
+        if headers == nil then
+            headers = {
+                ["Authorization"] = "Bearer " .. self.access_token,
+            }
+        end
+    else
+        -- regular url link to a foreign server
+        local file_url = apiurl
+        request.url = file_url
+        if headers == nil then
+            -- no need for a token here
+            headers = {}
+        end
+    end
+
+    request.method = method
+    
+    if filepath ~= "" then
+        request.sink = ltn12.sink.file(io.open(filepath, "w"))
+        socketutil:set_timeout(self.file_block_timeout, self.file_total_timeout)
+    else
+        request.sink = ltn12.sink.table(sink)
+        socketutil:set_timeout(self.block_timeout, self.total_timeout)
+    end
+    request.headers = headers
+    if body ~= "" then
+        request.source = ltn12.source.string(body)
+    end
+    Log:debug("API request - URL:", request.url, "Method:", method)
+    
+    -- Log request headers (hide auth info).
+    for k, v in pairs(headers or {}) do
+        if k == "Authorization" then
+            Log:debug("Header:", k, "= Bearer ***")
+        else
+            Log:debug("Header:", k, "=", v)
+        end
+    end
+
+      local code, resp_headers, status = socket.skip(1, http.request(request))
+      socketutil:reset_timeout()
+    
+    -- Process response headers.
+    if resp_headers then
+        Log:debug("Response code:", code, "Status:", status or "nil")
+        for k, v in pairs(resp_headers) do
+            Log:debug("Response header:", k, "=", v)
+        end
+    else
+        Log:error("No response headers received")
+        return nil, "network_error"
+    end
+    
+    -- Handle authentication errors - retry with fresh token if possible
+    if (code == 401 or code == 403) and not retry_auth and apiurl:sub(1, 1) == "/" then
+        Log:info("Authentication failed (", code, "), attempting to refresh token")
+        
+        -- Clear current token and try to get a fresh one
+        self.access_token = ""
+        self.token_expiry = 0
+        
+        if self:getBearerToken() then
+            Log:info("Token refreshed, retrying API call")
+            -- Retry the API call with the new token, but mark retry_auth to prevent infinite recursion
+            return self:callAPI(method, apiurl, nil, body, filepath, quiet, true)
+        else
+            Log:error("Failed to refresh token")
+            if not quiet then
+                UIManager:show(InfoMessage:new{
+                    text = _("Authentication failed. Please check your credentials."),
+                })
+            end
+            return nil, "auth_error", code
+        end
+    end
+    
+    -- Handle normal responses.
+      local response_content = nil
+      if filepath == "" then
+          response_content = table.concat(sink)
+      end
+
+      if code == 200 or code == 201 or code == 202 or code == 204 then  -- Treat 204 No Content as success.
+          if filepath ~= "" then
+              Log:info("File downloaded successfully to", filepath)
+              return true
+          else
+              local content = response_content or ""
+              Log:debug("Response content length:", #content, "bytes")
+            
+            if #content > 0 and #content < 500 then
+                Log:debug("Response content:", content)
+            end
+            
+            -- For 204 No Content, skip JSON parse and return success.
+            if code == 204 then
+                Log:debug("Successfully received 204 No Content response")
+                return true
+            elseif content ~= "" and (string.sub(content, 1,1) == "{" or string.sub(content, 1,1) == "[") then
+                  local ok, result = pcall(JSON.decode, content)
+                  if ok and result then
+                      Log:debug("Successfully parsed JSON response")
+                      return result
+                else
+                    Log:error("Failed to parse JSON:", result or "unknown error")
+                    if not quiet then
+                        UIManager:show(InfoMessage:new{
+                            text = _("Server response is not valid."), 
+                        })
+                    end
+                end
+            elseif content == "" then
+                -- Successful status with empty response.
+                Log:debug("Empty response with successful status code")
+                return true
+            else
+                Log:error("Response is not valid JSON")
+                if not quiet then
+                    UIManager:show(InfoMessage:new{
+                        text = _("Server response is not valid."), 
+                    })
+                end
+            end
+            return nil, "json_error"
+        end
+    else
+        if filepath ~= "" then
+            local entry_mode = lfs.attributes(filepath, "mode")
+            if entry_mode == "file" then
+                os.remove(filepath)
+                Log:warn("Removed failed download:", filepath)
+            end
+          elseif not quiet then
+              Log:error("Communication with server failed:", code)
+              UIManager:show(InfoMessage:new{
+                  text = _("Communication with server failed."), 
+              })
+          end
+          if response_content and response_content ~= "" then
+              Log:error("Response body:", response_content)
+          end
+          Log:error("Request failed:", status or code, "URL:", request.url)
+          return nil, "http_error", code, response_content
+      end
+  end
+
+function Readeck:synchronize()
+    local info = InfoMessage:new{ text = _("Connecting…") }
+    UIManager:show(info)
+    UIManager:forceRePaint()
+    UIManager:close(info)
+
+    if self:getBearerToken() == false then
+        return false
+    end
+    if self.download_queue and next(self.download_queue) ~= nil then
+        info = InfoMessage:new{ text = _("Adding articles from queue…") }
+        UIManager:show(info)
+        UIManager:forceRePaint()
+        for _, articleUrl in ipairs(self.download_queue) do
+            self:addArticle(articleUrl)
+        end
+        self.download_queue = {}
+        self:saveSettings()
+        UIManager:close(info)
+    end
+
+    local deleted_count = self:processLocalFiles()
+
+    info = InfoMessage:new{ text = _("Getting article list…") }
+    UIManager:show(info)
+    UIManager:forceRePaint()
+    UIManager:close(info)
+
+    local remote_article_ids = {}
+    local downloaded_count = 0
+    local failed_count = 0
+    if self.access_token ~= "" then
+        local articles = self:getArticleList()
+        if articles then
+            Log:debug("Number of articles:", #articles)
+
+            info = InfoMessage:new{ text = _("Downloading articles…") }
+            UIManager:show(info)
+            UIManager:forceRePaint()
+            UIManager:close(info)
+            for _, article in ipairs(articles) do
+                Log:debug("Processing article ID:", article.id)
+                remote_article_ids[ tostring(article.id) ] = true
+                local res = self:download(article)
+                if res == downloaded then
+                    downloaded_count = downloaded_count + 1
+                elseif res == failed then
+                    failed_count = failed_count + 1
+                end
+            end
+            -- synchronize remote deletions
+            deleted_count = deleted_count + self:processRemoteDeletes(remote_article_ids)
+
+            local msg
+            if failed_count ~= 0 then
+                msg = _("Processing finished.\n\nArticles downloaded: %1\nDeleted: %2\nFailed: %3")
+                info = InfoMessage:new{ text = T(msg, downloaded_count, deleted_count, failed_count) }
+            else
+                msg = _("Processing finished.\n\nArticles downloaded: %1\nDeleted: %2")
+                info = InfoMessage:new{ text = T(msg, downloaded_count, deleted_count) }
+            end
+            UIManager:show(info)
+        end -- articles
+    end -- access_token
+end
+
+function Readeck:processRemoteDeletes(remote_article_ids)
+    if not self.is_sync_remote_delete then
+        Log:debug("Processing of remote file deletions disabled.")
+        return 0
+    end
+    Log:debug("Articles IDs from server:", remote_article_ids)
+
+    local info = InfoMessage:new{ text = _("Synchronizing remote deletions…") }
+    UIManager:show(info)
+    UIManager:forceRePaint()
+    UIManager:close(info)
+    local deleted_count = 0
+    for entry in lfs.dir(self.directory) do
+        if entry ~= "." and entry ~= ".." then
+            local entry_path = self.directory .. "/" .. entry
+            local id = self:getArticleID(entry_path)
+            if not remote_article_ids[ id ] then
+                Log:debug("Deleting local file (deleted on server):", entry_path)
+                self:deleteLocalArticle(entry_path)
+                deleted_count = deleted_count + 1
+            end
+        end
+    end -- for entry
+    return deleted_count
+end
+
+function Readeck:processLocalFiles(mode)
+    if mode then
+        if self.is_auto_delete == false and mode ~= "manual" then
+            Log:debug("Automatic processing of local files disabled.")
+            return 0, 0
+        end
+    end
+
+    if self:getBearerToken() == false then
+        return 0, 0
+    end
+
+    local num_deleted = 0
+    if self.is_delete_finished or self.is_delete_read then
+        local info = InfoMessage:new{ text = _("Processing local files…") }
+        UIManager:show(info)
+        UIManager:forceRePaint()
+        UIManager:close(info)
+        for entry in lfs.dir(self.directory) do
+            if entry ~= "." and entry ~= ".." then
+                local entry_path = self.directory .. "/" .. entry
+                if DocSettings:hasSidecarFile(entry_path) then
+                    if self.send_review_as_tags then
+                        self:addTags(entry_path)
+                    end
+                    local doc_settings = DocSettings:open(entry_path)
+                    local summary = doc_settings:readSetting("summary")
+                    local status = summary and summary.status
+                    local percent_finished = doc_settings:readSetting("percent_finished")
+                    if status == "complete" or status == "abandoned" then
+                        if self.is_delete_finished then
+                            -- If we're archiving, optionally also mark as fully read on the server.
+                            -- "complete" typically implies finished reading; "abandoned" does not.
+                            local mark_read_complete = (status == "complete") or (percent_finished == 1)
+                            self:removeArticle(entry_path, mark_read_complete)
+                            num_deleted = num_deleted + 1
+                        end
+                    elseif percent_finished == 1 then -- 100% read
+                        if self.is_delete_read then
+                            self:removeArticle(entry_path, true)
+                            num_deleted = num_deleted + 1
+                        end
+                    end
+                end -- has sidecar
+            end -- not . and ..
+        end -- for entry
+    end -- flag checks
+    return num_deleted
+end
+
+function Readeck:addArticle(article_url)
+    Log:debug("Adding article", article_url)
+
+    if not article_url or self:getBearerToken() == false then
+        return false
+    end
+
+    local body = {
+        url = article_url,
+    }
+
+    -- If auto tags are set, add them to new articles.
+    if self.auto_tags and self.auto_tags ~= "" then
+        local tags = {}
+        for tag in util.gsplit(self.auto_tags, "[,]+", false) do
+            table.insert(tags, tag:gsub("^%s*(.-)%s*$", "%1")) -- Trim leading/trailing whitespace.
+        end
+        body.labels = tags
+    end
+
+    local body_JSON = JSON.encode(body)
+
+    local headers = {
+        ["Content-type"] = "application/json",
+        ["Accept"] = "application/json, */*",
+        ["Content-Length"] = tostring(#body_JSON),
+        ["Authorization"] = "Bearer " .. self.access_token,
+    }
+
+    return self:callAPI("POST", "/api/bookmarks", headers, body_JSON, "")  -- Update add-article path to include /api prefix.
+end
+
+function Readeck:addTags(path)
+    Log:debug("Managing tags for article", path)
+    local id = self:getArticleID(path)
+    if id then
+        local doc_settings = DocSettings:open(path)
+        local summary = doc_settings:readSetting("summary")
+        local tags_text = summary and summary.note
+        if tags_text and tags_text ~= "" then
+            Log:debug("Sending tags", tags_text, "for", path)
+
+            local tags = {}
+            for tag in util.gsplit(tags_text, "[,]+", false) do
+                table.insert(tags, tag:gsub("^%s*(.-)%s*$", "%1")) -- Trim leading/trailing whitespace.
+            end
+
+            local body = {
+                add_labels = tags,
+            }
+
+            local bodyJSON = JSON.encode(body)
+
+            local headers = {
+                ["Content-type"] = "application/json",
+                ["Accept"] = "application/json, */*",
+                ["Content-Length"] = tostring(#bodyJSON),
+                ["Authorization"] = "Bearer " .. self.access_token,
+            }
+
+            self:callAPI("PATCH", "/api/bookmarks/" .. id, headers, bodyJSON, "")  -- Update add-tags path to include /api prefix.
+        else
+            Log:debug("No tags to send for", path)
+        end
+    end
+end
+
+-- Remove (or archive) an article remotely and delete it locally.
+-- If mark_read_complete is true and we're archiving, also set read_progress=100 on the server.
+function Readeck:removeArticle(path, mark_read_complete)
+    Log:debug("Removing article", path)
+    local id = self:getArticleID(path)
+    if id then
+        if self.is_archiving_deleted then
+            local body = {
+                is_archived = true
+            }
+            if mark_read_complete then
+                body.read_progress = 100
+            end
+            local bodyJSON = JSON.encode(body)
+
+            local headers = {
+                ["Content-type"] = "application/json",
+                ["Accept"] = "application/json, */*",
+                ["Content-Length"] = tostring(#bodyJSON),
+                ["Authorization"] = "Bearer " .. self.access_token,
+            }
+
+            self:callAPI("PATCH", "/api/bookmarks/" .. id, headers, bodyJSON, "")  -- Update archive path to include /api prefix.
+        else
+            self:callAPI("DELETE", "/api/bookmarks/" .. id, nil, "", "")  -- Update delete path to include /api prefix.
+        end
+        self:deleteLocalArticle(path)
+    end
+end
+
+function Readeck:deleteLocalArticle(path)
+    if lfs.attributes(path, "mode") == "file" then
+        FileManager:deleteFile(path, true)
+    end
+
+    local sidecar_dir = _get_sidecar_dir(path)
+    if sidecar_dir then
+        local metadata_path = sidecar_dir .. "/readeck_metadata.lua"
+        if lfs.attributes(metadata_path, "mode") == "file" then
+            _delete_dir_recursive(sidecar_dir)
+        end
+    end
+end
+
+function Readeck:getArticleID(path)
+    -- 1. Find the starting position of the prefix
+    local start_pos = path:find(article_id_suffix, 1, true) -- `true` disables pattern matching
+    if not start_pos then
+        return -- Suffix not found
+    end
+
+    -- 2. Find the ending position of the postfix, starting after the prefix
+    local end_pos = path:find(article_id_postfix, start_pos)
+    if not end_pos then
+        return -- Postfix not found
+    end
+
+    -- 3. Extract the ID from between the markers
+    local id_start = start_pos + article_id_suffix:len()
+    local id_end = end_pos - 1
+    return path:sub(id_start, id_end)
+end
+
+function Readeck:refreshCurrentDirIfNeeded()
+    if FileManager.instance then
+        FileManager.instance:onRefresh()
+    end
+end
+
+function Readeck:setFilterTag(touchmenu_instance)
+   self.tag_dialog = InputDialog:new {
+        title =  _("Enter a single tag to filter articles on"),
+        input = self.filter_tag,
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(self.tag_dialog)
+                    end,
+                },
+                {
+                    text = _("OK"),
+                    is_enter_default = true,
+                    callback = function()
+                        self.filter_tag = self.tag_dialog:getInputText()
+                        self:saveSettings()
+                        touchmenu_instance:updateItems()
+                        UIManager:close(self.tag_dialog)
+                    end,
+                }
+            }
+        },
+    }
+    UIManager:show(self.tag_dialog)
+    self.tag_dialog:onShowKeyboard()
+end
+
+function Readeck:setTagsDialog(touchmenu_instance, title, description, value, callback)
+   self.tags_dialog = InputDialog:new {
+        title =  title,
+        description = description,
+        input = value,
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(self.tags_dialog)
+                    end,
+                },
+                {
+                    text = _("Set tags"),
+                    is_enter_default = true,
+                    callback = function()
+                        callback(self.tags_dialog:getInputText())
+                        self:saveSettings()
+                        touchmenu_instance:updateItems()
+                        UIManager:close(self.tags_dialog)
+                    end,
+                }
+            }
+        },
+    }
+    UIManager:show(self.tags_dialog)
+    self.tags_dialog:onShowKeyboard()
+end
+
+function Readeck:editServerSettings()
+    local text_info = T(_([[
+Enter the details of your Readeck server and account.
+
+You can use either an API token (preferred) or username/password for authentication.
+
+If you use both, the API token will be used first. If token authentication fails, username/password will be used as fallback.
+
+Note: For the Server URL, provide the base URL without the /api path (e.g., http://example.com).
+
+Restart KOReader after editing the config file.]]), BD.dirpath(DataStorage:getSettingsDir()))
+
+    self.settings_dialog = MultiInputDialog:new {
+        title = _("Readeck settings"),
+        fields = {
+            {
+                text = self.server_url,
+                hint = _("Server URL (without /api)")
+            },
+            {
+                text = self.auth_token,
+                hint = _("API Token (recommended)")
+            },
+            {
+                text = self.username,
+                hint = _("Username (alternative)")
+            },
+            {
+                text = self.password,
+                text_type = "password",
+                hint = _("Password (alternative)")
+            },
+        },
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(self.settings_dialog)
+                    end
+                },
+                {
+                    text = _("Info"),
+                    callback = function()
+                        UIManager:show(InfoMessage:new{ text = text_info })
+                    end
+                },
+                {
+                    text = _("Apply"),
+                    callback = function()
+                        local myfields = self.settings_dialog:getFields()
+                        self.server_url = myfields[1]:gsub("/*$", "")  -- remove all trailing "/" slashes
+                        self.auth_token = myfields[2]
+                        self.username   = myfields[3]
+                        self.password   = myfields[4]
+                        self:saveSettings()
+                        UIManager:close(self.settings_dialog)
+                    end
+                },
+            },
+        },
+    }
+    UIManager:show(self.settings_dialog)
+    self.settings_dialog:onShowKeyboard()
+end
+
+function Readeck:editClientSettings()
+    self.client_settings_dialog = MultiInputDialog:new {
+        title = _("Readeck client settings"),
+        fields = {
+            {
+                text = self.articles_per_sync,
+                description = _("Number of articles"),
+                input_type = "number",
+                hint = _("Number of articles to download per sync")
+            },
+        },
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(self.client_settings_dialog)
+                    end
+                },
+                {
+                    text = _("Apply"),
+                    callback = function()
+                        local myfields = self.client_settings_dialog:getFields()
+                        self.articles_per_sync = math.max(1, tonumber(myfields[1]) or self.articles_per_sync)
+                        self:saveSettings(myfields)
+                        UIManager:close(self.client_settings_dialog)
+                    end
+                },
+            },
+        },
+    }
+    UIManager:show(self.client_settings_dialog)
+    self.client_settings_dialog:onShowKeyboard()
+end
+
+function Readeck:setDownloadDirectory(touchmenu_instance)
+    require("ui/downloadmgr"):new{
+        onConfirm = function(path)
+            Log:debug("Set download directory to:", path)
+            self.directory = path
+            self:saveSettings()
+            if touchmenu_instance then
+                touchmenu_instance:updateItems()
+            end
+        end,
+    }:chooseDir()
+end
+
+function Readeck:saveSettings()
+    local tempsettings = {
+        server_url            = self.server_url,
+        auth_token            = self.auth_token,
+        username              = self.username,
+        password              = self.password,
+        directory             = self.directory,
+        filter_tag            = self.filter_tag,
+        sort_param            = self.sort_param,
+        ignore_tags           = self.ignore_tags,
+        auto_tags             = self.auto_tags,
+        is_delete_finished    = self.is_delete_finished,
+        is_delete_read        = self.is_delete_read,
+        is_archiving_deleted  = self.is_archiving_deleted,
+        is_auto_delete        = self.is_auto_delete,
+        is_sync_remote_delete = self.is_sync_remote_delete,
+        articles_per_sync     = self.articles_per_sync,
+        send_review_as_tags   = self.send_review_as_tags,
+        remove_finished_from_history = self.remove_finished_from_history,
+        remove_read_from_history = self.remove_read_from_history,
+        download_queue        = self.download_queue,
+        block_timeout         = self.block_timeout,
+        total_timeout         = self.total_timeout,
+        file_block_timeout    = self.file_block_timeout,
+        file_total_timeout    = self.file_total_timeout,
+        access_token          = self.access_token,
+        token_expiry          = self.token_expiry,
+        cached_auth_token     = self.cached_auth_token,
+        cached_username       = self.cached_username,
+        cached_password       = self.cached_password,
+        cached_server_url     = self.cached_server_url,
+    }
+    self.rd_settings:saveSetting("readeck", tempsettings)
+    self.rd_settings:flush()
+end
+
+function Readeck:readSettings()
+    local rd_settings = LuaSettings:open(DataStorage:getSettingsDir().."/readeck.lua")
+    rd_settings:readSetting("readeck", {})
+    return rd_settings
+end
+
+function Readeck:saveRDSettings(setting)
+    if not self.rd_settings then self.rd_settings = self:readSettings() end
+    self.rd_settings:saveSetting("readeck", setting)
+    self.rd_settings:flush()
+end
+
+function Readeck:onAddReadeckArticle(article_url)
+    if not NetworkMgr:isOnline() then
+        self:addToDownloadQueue(article_url)
+        UIManager:show(InfoMessage:new{
+            text = T(_("Article added to download queue:\n%1"), BD.url(article_url)),
+            timeout = 1,
+         })
+        return
+    end
+
+    local readeck_result = self:addArticle(article_url)
+    if readeck_result then
+        UIManager:show(InfoMessage:new{
+            text = T(_("Article added to Readeck:\n%1"), BD.url(article_url)),
+        })
+    else
+        UIManager:show(InfoMessage:new{
+            text = T(_("Error adding link to Readeck:\n%1"), BD.url(article_url)),
+        })
+    end
+
+    -- stop propagation
+    return true
+end
+
+function Readeck:onSynchronizeReadeck()
+    local connect_callback = function()
+        self:synchronize()
+        self:refreshCurrentDirIfNeeded()
+    end
+    NetworkMgr:runWhenOnline(connect_callback)
+
+    -- stop propagation
+    return true
+end
+
+function Readeck:getLastPercent()
+    local percent = self.ui.paging and self.ui.paging:getLastPercent() or self.ui.rolling:getLastPercent()
+    return Math.roundPercent(percent)
+end
+
+function Readeck:addToDownloadQueue(article_url)
+    table.insert(self.download_queue, article_url)
+    self:saveSettings()
+end
+
+function Readeck:onCloseDocument()
+    if self.remove_finished_from_history or self.remove_read_from_history then
+        local document_full_path = self.ui.document.file
+        local summary = self.ui.doc_settings:readSetting("summary")
+        local status = summary and summary.status
+        local is_finished = status == "complete" or status == "abandoned"
+        local is_read = self:getLastPercent() == 1
+
+        if document_full_path
+           and self.directory
+           and ( (self.remove_finished_from_history and is_finished) or (self.remove_read_from_history and is_read) )
+           and self.directory == string.sub(document_full_path, 1, string.len(self.directory)) then
+            ReadHistory:removeItemByPath(document_full_path)
+            self.ui:setLastDirForFileBrowser(self.directory)
+        end
+    end
+end
+
+function Readeck:editTimeoutSettings()
+    self.timeout_settings_dialog = MultiInputDialog:new {
+        title = _("Set timeout"),
+        fields = {
+            {
+                text = self.block_timeout,
+                description = _("Block timeout (seconds)"),
+                input_type = "number",
+                hint = _("Block timeout")
+            },
+            {
+                text = self.total_timeout,
+                description = _("Total timeout (seconds)"),
+                input_type = "number",
+                hint = _("Total timeout")
+            },
+            {
+                text = self.file_block_timeout,
+                description = _("File block timeout (seconds)"),
+                input_type = "number",
+                hint = _("File block timeout")
+            },
+            {
+                text = self.file_total_timeout,
+                description = _("File total timeout (seconds)"),
+                input_type = "number",
+                hint = _("File total timeout")
+            },
+        },
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(self.timeout_settings_dialog)
+                    end
+                },
+                {
+                    text = _("Apply"),
+                    callback = function()
+                        local myfields = self.timeout_settings_dialog:getFields()
+                        self.block_timeout = math.max(1, tonumber(myfields[1]) or self.block_timeout)
+                        self.total_timeout = math.max(1, tonumber(myfields[2]) or self.total_timeout)
+                        self.file_block_timeout = math.max(1, tonumber(myfields[3]) or self.file_block_timeout)
+                        self.file_total_timeout = math.max(1, tonumber(myfields[4]) or self.file_total_timeout)
+                        self:saveSettings(myfields)
+                        UIManager:close(self.timeout_settings_dialog)
+                    end
+                },
+            },
+        },
+    }
+    UIManager:show(self.timeout_settings_dialog)
+    self.timeout_settings_dialog:onShowKeyboard()
+end
+
+function Readeck:setSortParam(touchmenu_instance)
+    local radio_buttons = {}
+
+    for _, opt in ipairs(self.sort_options) do
+        local key, value = opt[1], opt[2]
+        table.insert(radio_buttons, {
+            {text = value, provider = key, checked = (self.sort_param == key)}
+        })
+    end
+
+    UIManager:show(RadioButtonWidget:new{
+        title_text = _("Sort articles by"),
+        cancel_text = _("Cancel"),
+        ok_text = _("Apply"),
+        radio_buttons = radio_buttons,
+        callback = function(radio)
+            if radio then
+                self.sort_param = radio.provider
+                self:saveSettings()
+                if touchmenu_instance then
+                    touchmenu_instance:updateItems()
+                end
+            end
+        end,
+    })
+end
+
+return Readeck
